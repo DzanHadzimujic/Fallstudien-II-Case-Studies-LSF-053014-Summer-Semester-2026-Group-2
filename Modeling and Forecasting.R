@@ -27,7 +27,7 @@ select_ar_order <- function(y, max_p = 3, criterion = "BIC") {
       ic <- if (criterion == "AIC") AIC(fit) else BIC(fit)
       out$IC[p + 1] <- ic
       
-      # Early stop: IC increased for†’ the previous order was the best.
+      # Early stop: IC increased for the previous order was the best.
       if (ic > prev_ic) break
       
       prev_ic <- ic
@@ -112,7 +112,7 @@ cat("Saved AR order-selection plot to:",
 #
 # Procedure:
 #   1. Split each transformed stationary series into 70 % training / 30 % test.
-#   2. Fit AR(best_p) for€” the BIC-selected order from task b for€” on the training set.
+#   2. Fit AR(best_p) for the BIC-selected order from task b for on the training set.
 #   3. Generate h-step-ahead point forecasts for the entire test horizon.
 #   4. Compute MSFE = mean((actual - forecast)^2) over the test period.
 #   5. Plot forecasts vs actual values.
@@ -666,3 +666,34 @@ plot_sar_panel(sar_recovered, sar_ord_recovered$best_p, sar_ord_recovered$best_P
 par(mfrow = c(1, 1))
 dev.off()
 cat("Saved seasonal AR forecast plot to:", file.path(plot_dir, "08_sar_forecast.png"), "\n")
+
+#post model comparison, AR vs SAR
+ts_ex <-window(sar_cases$y_all, start = time(sar_cases$y_all)[sar_cases$n_train + 1])
+ts_ex[[1]]
+plot(ts_ex, type = "l")
+lines(sar_cases$yhat, col = "red", lty = 2)
+
+
+err_ar  <- fc_cases$yact  - fc_cases$yhat
+err_sar <- sar_cases$yact - sar_cases$yhat
+
+max(abs(err_ar))
+max(abs(err_sar))
+
+c(
+  ME_AR    = mean(err_ar),
+  ME_SAR   = mean(err_sar),
+  MAE_AR   = mean(abs(err_ar)),
+  MAE_SAR  = mean(abs(err_sar)),
+  RMSE_AR  = sqrt(mean(err_ar^2)),
+  RMSE_SAR = sqrt(mean(err_sar^2))
+)
+
+# Direct paired comparison: positive => SAR has larger squared error
+d <- err_sar^2 - err_ar^2
+c(mean_diff_sq = mean(d), prop_sar_worse = mean(d > 0))
+
+plot(err_ar^2, xlab = "AR squared error", ylab = "SAR squared error",
+     main = "Squared errors: AR vs SAR (log1p scale)")
+plot(err_sar^2, xlab = "AR squared error", ylab = "SAR squared error",
+     main = "Squared errors: AR vs SAR (log1p scale)")

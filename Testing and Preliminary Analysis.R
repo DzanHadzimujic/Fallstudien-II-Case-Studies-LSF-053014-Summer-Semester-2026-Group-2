@@ -1,6 +1,6 @@
 ### 5b. Stationarity tests on transformed series ------------------------------
-# ADF  for€” H0: unit root (non-stationary).  Small p-value for†’ reject H0 for†’ stationary.
-# KPSS for€” H0: stationary.                  Small p-value for†’ reject H0 for†’ non-stationary.
+# ADF  for H0: unit root (non-stationary).  Small p-value: reject H0 for stationary.
+# KPSS for H0: stationary.                  Small p-value: reject H0 for non-stationary.
 # We want: ADF p < 0.05  AND  KPSS p > 0.05  to conclude stationarity.
 
 run_stationarity_tests <- function(x, name) {
