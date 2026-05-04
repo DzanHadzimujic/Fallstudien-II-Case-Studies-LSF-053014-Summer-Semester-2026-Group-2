@@ -72,16 +72,16 @@ cat("\nMissing values per column:\n"); print(colSums(is.na(covid_raw)))
 
 ### 3. Clean data --------------------------------------------------------------
 # Key cleaning logic (per RKI documentation):
-#   NeuerFall  = -1 for†’ case is being REMOVED (correction) for†’ exclude from totals
-#   NeuerFall  =  0 for†’ established case (in today's and yesterday's snapshot)
-#   NeuerFall  =  1 for†’ newly added case
-# for†’ Keep NeuerFall %in% c(0, 1) for the case count series.
+#   NeuerFall  = -1 : case is being REMOVED (correction) for exclude from totals
+#   NeuerFall  =  0 : established case (in today's and yesterday's snapshot)
+#   NeuerFall  =  1 : newly added case
+# Keep NeuerFall in c(0, 1) for the case count series.
 #
-#   NeuerTodesfall = -9 for†’ no death event in this group for†’ exclude
-#   NeuerTodesfall = -1 for†’ death is being REMOVED (correction) for†’ exclude
-#   NeuerTodesfall =  0 for†’ established death
-#   NeuerTodesfall =  1 for†’ newly reported death
-# for†’ Keep NeuerTodesfall %in% c(0, 1) for the death count series.
+#   NeuerTodesfall = -9 : no death event in this group for exclude
+#   NeuerTodesfall = -1 : death is being REMOVED (correction) for exclude
+#   NeuerTodesfall =  0 : established death
+#   NeuerTodesfall =  1 : newly reported death
+# Keep NeuerTodesfall in c(0, 1) for the death count series.
 covid_raw %>%
   group_by(NeuerFall) %>%
   summarise(count = n()) %>%
@@ -233,32 +233,3 @@ ts_recovered_id <- diff(diff(log1p(ts_recovered), lag = 7), differences = 1)
 ### improve forecast accuracy.
 ### --------------------------------------------------------------------------
 
-ts_ex <-window(sar_cases$y_all, start = time(sar_cases$y_all)[sar_cases$n_train + 1])
-ts_ex[[1]]
-plot(ts_ex, type = "l")
-lines(sar_cases$yhat, col = "red", lty = 2)
-
-
-err_ar  <- fc_cases$yact  - fc_cases$yhat
-err_sar <- sar_cases$yact - sar_cases$yhat
-
-max(abs(err_ar))
-max(abs(err_sar))
-
-c(
-  ME_AR    = mean(err_ar),
-  ME_SAR   = mean(err_sar),
-  MAE_AR   = mean(abs(err_ar)),
-  MAE_SAR  = mean(abs(err_sar)),
-  RMSE_AR  = sqrt(mean(err_ar^2)),
-  RMSE_SAR = sqrt(mean(err_sar^2))
-)
-
-# Direct paired comparison: positive => SAR has larger squared error
-d <- err_sar^2 - err_ar^2
-c(mean_diff_sq = mean(d), prop_sar_worse = mean(d > 0))
-
-plot(err_ar^2, xlab = "AR squared error", ylab = "SAR squared error",
-     main = "Squared errors: AR vs SAR (log1p scale)")
-plot(err_sar^2, xlab = "AR squared error", ylab = "SAR squared error",
-     main = "Squared errors: AR vs SAR (log1p scale)")
