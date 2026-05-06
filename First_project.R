@@ -177,40 +177,175 @@ log_deaths    <- log1p(ts_deaths)
 log_recovered <- log1p(ts_recovered)
 
 # Detect seasonal period from periodogram (math-based selection)
-detect_seasonal_period <- function(series, min_period = 2, max_period = 30) {
+# peak_rank = 1 -> strongest peak, 2 -> second strongest peak, etc.
+detect_top_periods <- function(series, min_period = 2, max_period = 600, n_peaks = 2) {
+  # Compute periodogram on log scale to stabilize variance before spectral analysis.
   spec_obj <- spec.pgram(log1p(series),
                          plot = FALSE,
                          demean = TRUE,
                          detrend = TRUE,
                          taper = 0)
 
-  periods <- 1 / spec_obj$freq
+  # Convert spectral frequency to period in days:
+  # period = (observations per year) / (cycles per year).
+  periods <- frequency(series) / spec_obj$freq
   keep <- periods >= min_period & periods <= max_period
 
+  # Fallback if requested period window contains no frequencies.
   if (!any(keep)) {
     return(7L)
   }
 
-  peak_idx <- which.max(spec_obj$spec[keep])
-  detected_period <- round(periods[keep][peak_idx])
+  # Keep only the selected period window.
+  kept_spec <- spec_obj$spec[keep]
+  kept_periods <- periods[keep]
 
-  as.integer(max(2, detected_period))
+  # Prefer local maxima to avoid selecting neighboring bins from one broad peak.
+  n <- length(kept_spec)
+  local_max <- rep(FALSE, n)
+  if (n == 1) {
+    local_max[1] <- TRUE
+  } else {
+    local_max[1] <- kept_spec[1] > kept_spec[2]
+    local_max[n] <- kept_spec[n] > kept_spec[n - 1]
+    if (n > 2) {
+      for (i in 2:(n - 1)) {
+        local_max[i] <- kept_spec[i] > kept_spec[i - 1] && kept_spec[i] > kept_spec[i + 1]
+      }
+    }
+  }
+
+  peak_candidates <- which(local_max)
+  # If no strict local maxima exist, rank all bins by spectral power.
+  if (length(peak_candidates) == 0) {
+    peak_candidates <- seq_len(n)
+  }
+
+  # Rank candidate peaks by spectral density from strongest to weakest.
+  ranked <- peak_candidates[order(kept_spec[peak_candidates], decreasing = TRUE)]
+  # Round to integer days and enforce a minimum period of 2 days.
+  ranked_periods <- as.integer(pmax(2, round(kept_periods[ranked])))
+
+  # Keep distinct rounded periods so rank 2 is not the same cycle repeated.
+  distinct_periods <- unique(ranked_periods)
+
+  # Return top n requested distinct periodicities.
+  n_use <- min(max(1L, as.integer(n_peaks)), length(distinct_periods))
+  distinct_periods[seq_len(n_use)]
 }
 
-season_cases <- detect_seasonal_period(ts_cases)+1
-season_deaths <- detect_seasonal_period(ts_deaths)+1
-season_recovered <- detect_seasonal_period(ts_recovered)+1
+detect_seasonal_period <- function(series, min_period = 2, max_period = 600, peak_rank = 2) {
+  # Reuse ranked periods and return the requested rank:
+  # peak_rank = 1 (primary), 2 (secondary), etc.
+  ranked_periods <- detect_top_periods(
+    series,
+    min_period = min_period,
+    max_period = max_period,
+    n_peaks = peak_rank
+  )
 
-cat("\nDetected seasonal period (days) - cases:", 7, "\n")
-cat("Detected seasonal period (days) - deaths:", 7, "\n")
-cat("Detected seasonal period (days) - recovered:", 7, "\n")
+  # Clamp to available output length for safety.
+  ranked_periods[min(length(ranked_periods), max(1L, as.integer(peak_rank)))]
+}
 
-# For ACF/PACF model identification, use transformed and differenced series:
-# log1p stabilizes variance, seasonal difference uses detected period,
-# first difference removes remaining trend.
-ts_cases_id <- diff(diff(log1p(ts_cases), lag = 7), differences = 1)
-ts_deaths_id <- diff(diff(log1p(ts_deaths), lag = 7), differences = 1)
-ts_recovered_id <- diff(diff(log1p(ts_recovered), lag = 7), differences = 1)
+season_cases <- detect_seasonal_period(ts_cases, peak_rank = 2)
+season_deaths <- detect_seasonal_period(ts_deaths, peak_rank = 2)
+season_recovered <- detect_seasonal_period(ts_recovered, peak_rank = 2)
+
+peaks_cases <- detect_top_periods(ts_cases, n_peaks = 2)
+peaks_deaths <- detect_top_periods(ts_deaths, n_peaks = 2)
+peaks_recovered <- detect_top_periods(ts_recovered, n_peaks = 2)
+
+cat("\nTop periodicities (days) from periodogram:\n")
+cat(sprintf("Cases:     primary = %d | secondary = %d\n", peaks_cases[1], peaks_cases[min(2, length(peaks_cases))]))
+cat(sprintf("Deaths:    primary = %d | secondary = %d\n", peaks_deaths[1], peaks_deaths[min(2, length(peaks_deaths))]))
+cat(sprintf("Recovered: primary = %d | secondary = %d\n", peaks_recovered[1], peaks_recovered[min(2, length(peaks_recovered))]))
+
+cat("\nDetected seasonal period (days) - cases:", season_cases, "\n")
+cat("Detected seasonal period (days) - deaths:", season_deaths, "\n")
+cat("Detected seasonal period (days) - recovered:", season_recovered, "\n")
+
+# Differencing diagnostics: compare strategies and inspect residual autocorrelation.
+# Note: strong residual ACF after heavy differencing is common when over-differencing
+# and then fitting AR-only models, because differencing can induce MA structure.
+acf_diag <- function(x, label) {
+  x_num <- as.numeric(x)
+  a <- stats::acf(x_num, lag.max = 400, plot = FALSE)$acf
+  acf1 <- a[2]
+  acf7 <- if (length(a) >= 8) a[8] else NA_real_
+  acf14 <- if (length(a) >= 15) a[15] else NA_real_
+  acf365 <- if (length(a) >= 366) a[366] else NA_real_
+  lb40 <- Box.test(x_num, lag = 40, type = "Ljung-Box")$p.value
+  cat(sprintf(
+    "%s | ACF(1)=%.3f ACF(7)=%.3f ACF(14)=%.3f ACF(365)=%.3f | Ljung-Box p(40)=%.4f\n",
+    label, acf1, acf7, acf14, acf365, lb40
+  ))
+}
+
+cases_d1_D7 <- diff(diff(log1p(ts_cases), lag = 7), differences = 1)
+cases_d1_D365 <- diff(diff(log1p(ts_cases), lag = 365), differences = 1)
+cases_d1_D7_D365 <- diff(diff(diff(log1p(ts_cases), lag = 7), lag = 365), differences = 1)
+
+deaths_d1_D7 <- diff(diff(log1p(ts_deaths), lag = 7), differences = 1)
+deaths_d1_D365 <- diff(diff(log1p(ts_deaths), lag = 365), differences = 1)
+deaths_d1_D7_D365 <- diff(diff(diff(log1p(ts_deaths), lag = 7), lag = 365), differences = 1)
+
+cat("\nAutocorrelation diagnostics by differencing strategy:\n")
+acf_diag(cases_d1_D7, "Cases d=1 + D7")
+acf_diag(cases_d1_D365, "Cases d=1 + D365")
+acf_diag(cases_d1_D7_D365, "Cases d=1 + D7 + D365")
+acf_diag(deaths_d1_D7, "Deaths d=1 + D7")
+acf_diag(deaths_d1_D365, "Deaths d=1 + D365")
+acf_diag(deaths_d1_D7_D365, "Deaths d=1 + D7 + D365")
+
+# For tasks (b)-(d), use weekly seasonal differencing + first differencing.
+# Annual seasonality is modeled explicitly later in task (e) via SARIMA with period=365.
+ts_cases_id <- cases_d1_D7
+ts_deaths_id <- deaths_d1_D7
+
+# Visual check: transformed series after trend/seasonality removal
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
+
+plot(ts_cases_id,
+  type = "l", col = "steelblue", lwd = 0.8,
+  main = "Cases: after seasonal + trend differencing",
+  xlab = "Time", ylab = "Transformed value")
+abline(h = 0, col = "gray50", lty = 2)
+
+plot(ts_deaths_id,
+  type = "l", col = "firebrick", lwd = 0.8,
+  main = "Deaths: after seasonal + trend differencing",
+  xlab = "Time", ylab = "Transformed value")
+abline(h = 0, col = "gray50", lty = 2)
+
+par(mfrow = c(1, 1))
+
+transformed_plot_dir <- file.path(getwd(), "plots")
+if (!dir.exists(transformed_plot_dir)) {
+  dir.create(transformed_plot_dir, recursive = TRUE)
+}
+
+png(filename = file.path(transformed_plot_dir, "02c_transformed_series_after_differencing.png"),
+    width = 1600, height = 1400, res = 150)
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
+
+plot(ts_cases_id,
+  type = "l", col = "steelblue", lwd = 0.8,
+  main = "Cases: after seasonal + trend differencing",
+  xlab = "Time", ylab = "Transformed value")
+abline(h = 0, col = "gray50", lty = 2)
+
+plot(ts_deaths_id,
+  type = "l", col = "firebrick", lwd = 0.8,
+  main = "Deaths: after seasonal + trend differencing",
+  xlab = "Time", ylab = "Transformed value")
+abline(h = 0, col = "gray50", lty = 2)
+
+par(mfrow = c(1, 1))
+dev.off()
+
+
+
 
 ### 5b. Stationarity tests on transformed series ------------------------------
 # ADF  — H0: unit root (non-stationary).  Small p-value → reject H0 → stationary.
@@ -245,7 +380,7 @@ if (!dir.exists(plot_dir)) {
 }
 
 ### 6. Time series plots -------------------------------------------------------
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 
 plot(daily_cases$Meldedatum, daily_cases$cases,
      type = "l", col = "steelblue", lwd = 0.8,
@@ -257,17 +392,12 @@ plot(daily_deaths$Meldedatum, daily_deaths$deaths,
      main = "Daily Covid-19 Deaths in Germany (by Meldedatum)",
      xlab = "Date", ylab = "Deaths")
 
-plot(daily_recovered$Meldedatum, daily_recovered$recovered,
-   type = "l", col = "darkgreen", lwd = 0.8,
-   main = "Daily Covid-19 Recovered in Germany (by Meldedatum)",
-   xlab = "Date", ylab = "Recovered")
-
 par(mfrow = c(1, 1))
 
 # Save time series panel
-png(filename = file.path(plot_dir, "01_time_series_levels_cases_deaths_recovered.png"),
-  width = 1400, height = 1400, res = 150)
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+png(filename = file.path(plot_dir, "01_time_series_levels_cases_deaths.png"),
+  width = 1400, height = 1000, res = 150)
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 
 plot(daily_cases$Meldedatum, daily_cases$cases,
   type = "l", col = "steelblue", lwd = 0.8,
@@ -279,24 +409,18 @@ plot(daily_deaths$Meldedatum, daily_deaths$deaths,
   main = "Daily Covid-19 Deaths in Germany (by Meldedatum)",
   xlab = "Date", ylab = "Deaths")
 
-plot(daily_recovered$Meldedatum, daily_recovered$recovered,
-  type = "l", col = "darkgreen", lwd = 0.8,
-  main = "Daily Covid-19 Recovered in Germany (by Meldedatum)",
-  xlab = "Date", ylab = "Recovered")
-
 par(mfrow = c(1, 1))
 dev.off()
 
 ### 7. Periodogram (seasonality detection) -------------------------------------
 # Detect dominant seasonal periods from spectral peaks.
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 
 s1<-spec.pgram(log1p(ts_cases),
        demean = TRUE,
        detrend = TRUE,
        taper = 0,
        main = paste("Periodogram - Cases | detected period:", season_cases, "days"))
-1/s1$freq
 
 spec.pgram(log1p(ts_deaths),
        demean = TRUE,
@@ -304,17 +428,11 @@ spec.pgram(log1p(ts_deaths),
        taper = 0,
        main = paste("Periodogram - Deaths | detected period:", season_deaths, "days"))
 
-spec.pgram(log1p(ts_recovered),
-       demean = TRUE,
-       detrend = TRUE,
-       taper = 0,
-       main = paste("Periodogram - Recovered | detected period:", season_recovered, "days"))
-
 par(mfrow = c(1, 1))
 
 png(filename = file.path(plot_dir, "02_periodogram_detected_seasonality.png"),
-  width = 1400, height = 1400, res = 150)
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+  width = 1400, height = 1000, res = 150)
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 
 spec.pgram(log1p(ts_cases),
        demean = TRUE,
@@ -328,20 +446,47 @@ spec.pgram(log1p(ts_deaths),
        taper = 0,
        main = paste("Periodogram - Deaths | detected period:", season_deaths, "days"))
 
-spec.pgram(log1p(ts_recovered),
-       demean = TRUE,
-       detrend = TRUE,
-       taper = 0,
-       main = paste("Periodogram - Recovered | detected period:", season_recovered, "days"))
+par(mfrow = c(1, 1))
+dev.off()
+
+### 8. ACF/PACF on log-level series (seasonality visibility) ------------------
+# For task (a), inspect correlation on log1p levels BEFORE differencing.
+# Seasonal peaks around weekly lags should be visible here.
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+Acf(log_cases, lag.max = 60,
+    main = "ACF - Cases (log1p levels)")
+Pacf(log_cases, lag.max = 60,
+     main = "PACF - Cases (log1p levels)")
+
+Acf(log_deaths, lag.max = 60,
+    main = "ACF - Deaths (log1p levels)")
+Pacf(log_deaths, lag.max = 60,
+     main = "PACF - Deaths (log1p levels)")
+
+par(mfrow = c(1, 1))
+
+png(filename = file.path(plot_dir, "02b_acf_pacf_log_levels.png"),
+    width = 1600, height = 1000, res = 150)
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+Acf(log_cases, lag.max = 60,
+    main = "ACF - Cases (log1p levels)")
+Pacf(log_cases, lag.max = 60,
+     main = "PACF - Cases (log1p levels)")
+
+Acf(log_deaths, lag.max = 60,
+    main = "ACF - Deaths (log1p levels)")
+Pacf(log_deaths, lag.max = 60,
+     main = "PACF - Deaths (log1p levels)")
 
 par(mfrow = c(1, 1))
 dev.off()
 
-### 8. ACF and PACF (model-identification scale) ------------------------------
-# ACF/PACF are shown on transformed and differenced series, which is preferable
-# for model identification compared to raw non-stationary levels.
+### 8b. ACF and PACF (model-identification scale) -----------------------------
+# ACF/PACF on transformed and differenced series for AR model identification.
 
-par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
 
 Acf(ts_cases_id, lag.max = 60,
   main = paste("ACF – Cases: log1p + d1 + D", season_cases))
@@ -352,18 +497,13 @@ Acf(ts_deaths_id, lag.max = 60,
   main = paste("ACF – Deaths: log1p + d1 + D", season_deaths))
 Pacf(ts_deaths_id, lag.max = 60,
    main = paste("PACF – Deaths: log1p + d1 + D", season_deaths))
-
-Acf(ts_recovered_id, lag.max = 60,
-  main = paste("ACF – Recovered: log1p + d1 + D", season_recovered))
-Pacf(ts_recovered_id, lag.max = 60,
-   main = paste("PACF – Recovered: log1p + d1 + D", season_recovered))
 
 par(mfrow = c(1, 1))
 
 # Save transformed ACF/PACF panel
 png(filename = file.path(plot_dir, "03_acf_pacf_transformed_d1_detectedD.png"),
-    width = 1600, height = 1400, res = 150)
-par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+  width = 1600, height = 1000, res = 150)
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
 
 Acf(ts_cases_id, lag.max = 60,
   main = paste("ACF – Cases: log1p + d1 + D", season_cases))
@@ -375,18 +515,13 @@ Acf(ts_deaths_id, lag.max = 60,
 Pacf(ts_deaths_id, lag.max = 60,
    main = paste("PACF – Deaths: log1p + d1 + D", season_deaths))
 
-Acf(ts_recovered_id, lag.max = 60,
-  main = paste("ACF – Recovered: log1p + d1 + D", season_recovered))
-Pacf(ts_recovered_id, lag.max = 60,
-   main = paste("PACF – Recovered: log1p + d1 + D", season_recovered))
-
 par(mfrow = c(1, 1))
 dev.off()
 
 # Save transformed level plot for variance-stabilisation discussion
-png(filename = file.path(plot_dir, "04_time_series_log1p_cases_deaths_recovered.png"),
-    width = 1400, height = 1400, res = 150)
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+png(filename = file.path(plot_dir, "04_time_series_log1p_cases_deaths.png"),
+  width = 1400, height = 1000, res = 150)
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 
 plot(daily_cases$Meldedatum, log1p(daily_cases$cases),
      type = "l", col = "steelblue", lwd = 0.8,
@@ -398,29 +533,43 @@ plot(daily_deaths$Meldedatum, log1p(daily_deaths$deaths),
      main = "Daily Covid-19 Deaths (log1p scale)",
      xlab = "Date", ylab = "log1p(Deaths)")
 
-plot(daily_recovered$Meldedatum, log1p(daily_recovered$recovered),
-     type = "l", col = "darkgreen", lwd = 0.8,
-     main = "Daily Covid-19 Recovered (log1p scale)",
-     xlab = "Date", ylab = "log1p(Recovered)")
-
 par(mfrow = c(1, 1))
 dev.off()
 
 cat("\nSaved plots to:", plot_dir, "\n")
 
+
+
+plot(365/s1$freq,s1$spec,type="p",ylim=c(0,2),xlim=c(2,10),
+xlab = "Period (days)",ylab = "Spectral Density", main = "Periodogram of log_cases")
+abline(v = 7, col = "red", lty = 2)
+abline(v = 3.5, col = "blue", lty = 2)
+
+
+# label it
+text(x = 4.5, y = 1.5,labels = "3.5 days cycle",pos = 1, col = "blue")
+text(x = 8, y = 1.5, labels = "7 days cycle",pos = 1, col = "red")
+grid()
+
+plot(365/s1$freq, s1$spec,type = "p",xlim = c(2, 365*2),xlab = "Period (days)",
+ylab = "Spectral Density",main = "Periodogram of log_cases")
+abline(v = 365, col = "orange", lty = 2)
+text(365, max(s1$spec, na.rm = TRUE) * 0.9,
+"1-year cycle", col = "orange", pos = 4)
+grid()
+
+
+
 ### 9. Task (b): AR(p) with IC-based order selection --------------------------
 # We fit pure AR(p) models on the transformed stationary series produced above.
 # p is selected by minimizing an information criterion (BIC by default).
 
-select_ar_order <- function(y, max_p = 3, criterion = "BIC") {
+select_ar_order <- function(y, max_p = 12, criterion = "BIC") {
   # Build a comparison table for AR orders p = 0,...,max_p.
   # Each row stores the selected information criterion for that fitted AR(p).
-  # Early-stopping rule: as soon as IC(p+1) > IC(p) we select p and stop,
-  # enforcing a monotone-decrease requirement on the IC path.
+  # Evaluate all candidate orders; IC is not guaranteed to be monotone in p.
   out <- data.frame(p = 0:max_p, IC = NA_real_)
   fits <- vector("list", max_p + 1)
-
-  prev_ic <- Inf   # IC at the previous (accepted) order
 
   for (p in 0:max_p) {
     # Fit a pure AR(p) model: y_t on lags y_{t-1},...,y_{t-p}.
@@ -436,11 +585,6 @@ select_ar_order <- function(y, max_p = 3, criterion = "BIC") {
       # Criterion used for order selection (BIC by default).
       ic <- if (criterion == "AIC") AIC(fit) else BIC(fit)
       out$IC[p + 1] <- ic
-
-      # Early stop: IC increased → the previous order was the best.
-      if (ic > prev_ic) break
-
-      prev_ic <- ic
     }
   }
 
@@ -475,48 +619,45 @@ format_ar_equation <- function(fit, y_name = "y_t") {
   paste0(lhs, " = epsilon_t")
 }
 
-ar_cases <- select_ar_order(ts_cases_id, max_p = 3, criterion = "BIC")
-ar_deaths <- select_ar_order(ts_deaths_id, max_p = 3, criterion = "BIC")
-ar_recovered <- select_ar_order(ts_recovered_id, max_p = 3, criterion = "BIC")
+Arima(ts_cases_id, order = c(12, 0, 0)
+, include.mean = TRUE, method = "ML")
 
-cat("\nAR order selection (BIC):\n")
+ar_cases <- select_ar_order(ts_cases_id, max_p = 13, criterion = "AIC")
+ar_deaths <- select_ar_order(ts_deaths_id, max_p = 13, criterion = "AIC")
+
+ar_cases$table
+ar_deaths$table
+
+cat("\nAR order selection (AIC):\n")
 cat("Cases: best p =", ar_cases$best_p, "\n")
 cat("Deaths: best p =", ar_deaths$best_p, "\n")
-cat("Recovered: best p =", ar_recovered$best_p, "\n")
 
 cat("\nCompact AR representation:\n")
 cat("Cases:", format_ar_equation(ar_cases$best_fit), "\n")
 cat("Deaths:", format_ar_equation(ar_deaths$best_fit), "\n")
-cat("Recovered:", format_ar_equation(ar_recovered$best_fit), "\n")
 
 # Save IC curves for order selection
-png(filename = file.path(plot_dir, "05_ar_order_selection_bic.png"),
-    width = 1400, height = 1200, res = 150)
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+png(filename = file.path(plot_dir, "05_ar_order_selection_aic.png"),
+  width = 1400, height = 900, res = 150)
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 
 plot(ar_cases$table$p, ar_cases$table$IC,
      type = "b", pch = 16, col = "steelblue",
-     main = "AR(p) order selection by BIC - Cases",
-     xlab = "p", ylab = "BIC")
+  main = "AR(p) order selection by AIC - Cases",
+  xlab = "p", ylab = "AIC")
 abline(v = ar_cases$best_p, col = "red", lty = 2)
 
 plot(ar_deaths$table$p, ar_deaths$table$IC,
      type = "b", pch = 16, col = "firebrick",
-     main = "AR(p) order selection by BIC - Deaths",
-     xlab = "p", ylab = "BIC")
+  main = "AR(p) order selection by AIC - Deaths",
+  xlab = "p", ylab = "AIC")
 abline(v = ar_deaths$best_p, col = "red", lty = 2)
-
-plot(ar_recovered$table$p, ar_recovered$table$IC,
-     type = "b", pch = 16, col = "darkgreen",
-     main = "AR(p) order selection by BIC - Recovered",
-     xlab = "p", ylab = "BIC")
-abline(v = ar_recovered$best_p, col = "red", lty = 2)
 
 par(mfrow = c(1, 1))
 dev.off()
 
 cat("Saved AR order-selection plot to:",
-    file.path(plot_dir, "05_ar_order_selection_bic.png"), "\n")
+  file.path(plot_dir, "05_ar_order_selection_aic.png"), "\n")
 
 ### 10. Task (c): In-sample forecasting with 70/30 train/test split -----------
 #
@@ -577,15 +718,12 @@ forecast_ar <- function(y_ts, best_p, split = 0.80) {
 
 fc_cases     <- forecast_ar(log_cases,     ar_cases$best_p)
 fc_deaths    <- forecast_ar(log_deaths,    ar_deaths$best_p)
-fc_recovered <- forecast_ar(log_recovered, ar_recovered$best_p)
 
 cat("\n--- Task (c): In-sample AR forecast MSFE (70/30 split, log1p scale) ---\n")
 cat(sprintf("Cases     AR(%d) | train n=%d | test n=%d | MSFE = sqrt(MSE) = %.6f\n",
             ar_cases$best_p,     fc_cases$n_train,     fc_cases$n_test,     fc_cases$msfe))
 cat(sprintf("Deaths    AR(%d) | train n=%d | test n=%d | MSFE = sqrt(MSE) = %.6f\n",
             ar_deaths$best_p,    fc_deaths$n_train,    fc_deaths$n_test,    fc_deaths$msfe))
-cat(sprintf("Recovered AR(%d) | train n=%d | test n=%d | MSFE = sqrt(MSE) = %.6f\n",
-            ar_recovered$best_p, fc_recovered$n_train, fc_recovered$n_test, fc_recovered$msfe))
 
 # Helper: draw actual-vs-forecast panel for one series ------------------
 plot_forecast_panel <- function(res, best_p, series_name, col_act, col_fc) {
@@ -627,19 +765,17 @@ plot_forecast_panel <- function(res, best_p, series_name, col_act, col_fc) {
 }
 
 # Screen display
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 plot_forecast_panel(fc_cases,     ar_cases$best_p,     "Cases",     "steelblue", "orange")
 plot_forecast_panel(fc_deaths,    ar_deaths$best_p,    "Deaths",    "firebrick", "purple")
-plot_forecast_panel(fc_recovered, ar_recovered$best_p, "Recovered", "darkgreen", "darkorange")
 par(mfrow = c(1, 1))
 
 # Save to PNG
 png(filename = file.path(plot_dir, "06_ar_insample_forecast.png"),
     width = 1600, height = 1400, res = 150)
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 plot_forecast_panel(fc_cases,     ar_cases$best_p,     "Cases",     "steelblue", "orange")
 plot_forecast_panel(fc_deaths,    ar_deaths$best_p,    "Deaths",    "firebrick", "purple")
-plot_forecast_panel(fc_recovered, ar_recovered$best_p, "Recovered", "darkgreen", "darkorange")
 par(mfrow = c(1, 1))
 dev.off()
 
@@ -704,6 +840,35 @@ daily_temp <- daily_temp %>%
     temp_c = zoo::na.locf(temp_c, fromLast = TRUE, na.rm = FALSE)
   )
 
+# 11.2b Load Germany daily vaccination data (source: RKI GitHub)
+# Columns: Impfdatum, BundeslandId_Impfort, Impfstoff, Impfserie, Anzahl
+vacc_url <- "https://raw.githubusercontent.com/robert-koch-institut/COVID-19-Impfungen_in_Deutschland/main/Deutschland_Bundeslaender_COVID-19-Impfungen.csv"
+vacc_file_name <- "Deutschland_Bundeslaender_COVID-19-Impfungen.csv"
+vacc_file_path <- file.path(getwd(), vacc_file_name)
+
+vacc_download_status <- download.file(vacc_url, destfile = vacc_file_path, mode = "wb")
+if (vacc_download_status != 0) {
+  stop("Vaccination download failed. Check internet connection or URL.")
+}
+
+vacc_raw <- read.csv(vacc_file_path, stringsAsFactors = FALSE)
+vacc_raw$Impfdatum <- as.Date(vacc_raw$Impfdatum)
+
+# Aggregate all doses nationally by date (all series, all states, all vaccines)
+daily_vacc_raw <- vacc_raw %>%
+  group_by(Meldedatum = Impfdatum) %>%
+  summarise(vacc_daily = sum(Anzahl, na.rm = TRUE), .groups = "drop") %>%
+  arrange(Meldedatum)
+
+# Expand to full analysis date range; pre-vaccination dates get 0
+# cum_vacc: running total of doses in millions (scaled to avoid numeric issues)
+daily_vacc <- data.frame(Meldedatum = all_dates$Meldedatum) %>%
+  left_join(daily_vacc_raw, by = "Meldedatum") %>%
+  mutate(
+    vacc_daily = replace(vacc_daily, is.na(vacc_daily), 0L),
+    cum_vacc   = cumsum(vacc_daily) / 1e6
+  )
+
 # 11.3 Build the final daily predictor table
 predictors_daily <- data.frame(Meldedatum = all_dates$Meldedatum) %>%
   left_join(daily_temp, by = "Meldedatum") %>%
@@ -711,19 +876,23 @@ predictors_daily <- data.frame(Meldedatum = all_dates$Meldedatum) %>%
             by = "Meldedatum") %>%
   left_join(daily_age_deaths %>% select(Meldedatum, share_deaths_80plus),
             by = "Meldedatum") %>%
+  left_join(daily_vacc %>% select(Meldedatum, cum_vacc), by = "Meldedatum") %>%
   mutate(
-    share_cases_60plus = replace(share_cases_60plus, is.na(share_cases_60plus), 0),
+    share_cases_60plus  = replace(share_cases_60plus,  is.na(share_cases_60plus),  0),
     share_deaths_80plus = replace(share_deaths_80plus, is.na(share_deaths_80plus), 0),
-    weekday = weekdays(Meldedatum),
+    cum_vacc            = replace(cum_vacc,            is.na(cum_vacc),            0),
+    weekday   = weekdays(Meldedatum),
     is_weekend = as.integer(weekday %in% c("Saturday", "Sunday")),
-    time_idx = as.numeric(Meldedatum - min(Meldedatum)) + 1
+    time_idx   = as.numeric(Meldedatum - min(Meldedatum)) + 1
   )
 
 cat("\nTask (d) predictors summary:\n")
 cat("Temperature source: Open-Meteo Archive API\n")
+cat("Vaccination source: RKI COVID-19-Impfungen_in_Deutschland\n")
 cat("Mean temperature (C):", round(mean(predictors_daily$temp_c, na.rm = TRUE), 2), "\n")
 cat("Mean share cases age 60+:", round(mean(predictors_daily$share_cases_60plus), 4), "\n")
 cat("Mean share deaths age 80+:", round(mean(predictors_daily$share_deaths_80plus), 4), "\n")
+cat("Max cumulative vaccinations (millions):", round(max(predictors_daily$cum_vacc), 2), "\n")
 
 # 11.4 Align exogenous variables with log-scale original series
 # Since we now use log1p(y) with d=1 (not pre-differenced), xreg should
@@ -734,12 +903,12 @@ if (nrow(predictors_daily) != length(ts_cases)) {
 }
 
 build_xreg <- function(cols) {
-  as.matrix(predictors_daily[1:nrow(predictors_daily), cols, drop = FALSE])
+  as.matrix(predictors_daily[, cols, drop = FALSE])
 }
 
-xreg_cases <- build_xreg(c("temp_c", "is_weekend", "time_idx", "share_cases_60plus"))
-xreg_deaths <- build_xreg(c("temp_c", "is_weekend", "time_idx", "share_deaths_80plus"))
-xreg_recovered <- build_xreg(c("temp_c", "is_weekend", "time_idx", "share_cases_60plus"))
+xreg_cases     <- build_xreg(c("temp_c", "cum_vacc", "is_weekend", "time_idx", "share_cases_60plus"))
+xreg_deaths    <- build_xreg(c("temp_c", "cum_vacc", "is_weekend", "time_idx", "share_deaths_80plus"))
+xreg_recovered <- build_xreg(c("temp_c", "cum_vacc", "is_weekend", "time_idx", "share_cases_60plus"))
 
 # 11.5 Fit ARX model and forecast (same 70/30 split as Task c)
 # Work on log1p(original) with d=1; xreg matches original series length.
@@ -786,25 +955,20 @@ forecast_arx <- function(y_ts, xreg_mat, best_p, split = 0.80) {
 
 arx_cases <- forecast_arx(log_cases, xreg_cases, ar_cases$best_p)
 arx_deaths <- forecast_arx(log_deaths, xreg_deaths, ar_deaths$best_p)
-arx_recovered <- forecast_arx(log_recovered, xreg_recovered, ar_recovered$best_p)
 
 cat("\n--- Task (d): ARX forecast MSFE (log1p scale) ---\n")
 cat(sprintf("Cases     ARX(%d) | MSFE = %.6f\n", ar_cases$best_p, arx_cases$msfe))
 cat(sprintf("Deaths    ARX(%d) | MSFE = %.6f\n", ar_deaths$best_p, arx_deaths$msfe))
-cat(sprintf("Recovered ARX(%d) | MSFE = %.6f\n", ar_recovered$best_p, arx_recovered$msfe))
 
 cat("\n--- Task (d): AR vs ARX (MSFE on log1p scale) ---\n")
 cat(sprintf("Cases:     AR = %.6f | ARX = %.6f\n", fc_cases$msfe, arx_cases$msfe))
 cat(sprintf("Deaths:    AR = %.6f | ARX = %.6f\n", fc_deaths$msfe, arx_deaths$msfe))
-cat(sprintf("Recovered: AR = %.6f | ARX = %.6f\n", fc_recovered$msfe, arx_recovered$msfe))
 
 cat("\nTask (d) selected ARX coefficients:\n")
 cat("Cases coefficients:\n")
 print(round(coef(arx_cases$fit), 4))
 cat("Deaths coefficients:\n")
 print(round(coef(arx_deaths$fit), 4))
-cat("Recovered coefficients:\n")
-print(round(coef(arx_recovered$fit), 4))
 
 plot_arx_panel <- function(res, best_p, series_name, col_act, col_fc) {
   t_all  <- res$time_all
@@ -842,19 +1006,17 @@ plot_arx_panel <- function(res, best_p, series_name, col_act, col_fc) {
 }
 
 # Screen display
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 plot_arx_panel(arx_cases, ar_cases$best_p, "Cases", "steelblue", "orange")
 plot_arx_panel(arx_deaths, ar_deaths$best_p, "Deaths", "firebrick", "purple")
-plot_arx_panel(arx_recovered, ar_recovered$best_p, "Recovered", "darkgreen", "darkorange")
 par(mfrow = c(1, 1))
 
 # Save to PNG
 png(filename = file.path(plot_dir, "07_arx_forecast_with_predictors.png"),
     width = 1600, height = 1400, res = 150)
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 plot_arx_panel(arx_cases, ar_cases$best_p, "Cases", "steelblue", "orange")
 plot_arx_panel(arx_deaths, ar_deaths$best_p, "Deaths", "firebrick", "purple")
-plot_arx_panel(arx_recovered, ar_recovered$best_p, "Recovered", "darkgreen", "darkorange")
 par(mfrow = c(1, 1))
 dev.off()
 
@@ -969,19 +1131,15 @@ cat("(Model: SARIMA(p,1,0)(P,1,0)[365] on log1p(original); grid p in 0..3, P in 
 
 sar_ord_cases     <- select_sar_order(log_cases,     max_p = 3, max_P = 3, season = 365)
 sar_ord_deaths    <- select_sar_order(log_deaths,    max_p = 3, max_P = 3, season = 365)
-sar_ord_recovered <- select_sar_order(log_recovered, max_p = 3, max_P = 3, season = 365)
 
 cat(sprintf("\nCases:     best p=%d, P=%d  (BIC=%.2f)\n",
             sar_ord_cases$best_p,     sar_ord_cases$best_P,     sar_ord_cases$best_bic))
 cat(sprintf("Deaths:    best p=%d, P=%d  (BIC=%.2f)\n",
             sar_ord_deaths$best_p,    sar_ord_deaths$best_P,    sar_ord_deaths$best_bic))
-cat(sprintf("Recovered: best p=%d, P=%d  (BIC=%.2f)\n",
-            sar_ord_recovered$best_p, sar_ord_recovered$best_P, sar_ord_recovered$best_bic))
 
 # 12.4 Print BIC tables
 cat("\nBIC grid – Cases:\n");     print(sar_ord_cases$table)
 cat("\nBIC grid – Deaths:\n");    print(sar_ord_deaths$table)
-cat("\nBIC grid – Recovered:\n"); print(sar_ord_recovered$table)
 
 # 12.5 Fit on full series and print equations
 fit_sar_cases <- forecast::Arima(log_cases,
@@ -992,37 +1150,34 @@ fit_sar_deaths <- forecast::Arima(log_deaths,
                                   order    = c(sar_ord_deaths$best_p,    1, 0),
                                   seasonal = list(order = c(sar_ord_deaths$best_P,    1, 0), period = 365),
                                   method   = "CSS-ML", include.mean = FALSE)
-fit_sar_recovered <- forecast::Arima(log_recovered,
-                                     order    = c(sar_ord_recovered$best_p, 1, 0),
-                                     seasonal = list(order = c(sar_ord_recovered$best_P, 1, 0), period = 365),
-                                     method   = "CSS-ML", include.mean = FALSE)
 
 format_sar_equation(fit_sar_cases,     "Cases",     season = 365)
 format_sar_equation(fit_sar_deaths,    "Deaths",    season = 365)
-format_sar_equation(fit_sar_recovered, "Recovered", season = 365)
 
 # 12.6 70/30 forecast & MSFE (on log1p scale)
 sar_cases     <- forecast_sar(log_cases,     sar_ord_cases$best_p,     sar_ord_cases$best_P)
 sar_deaths    <- forecast_sar(log_deaths,    sar_ord_deaths$best_p,    sar_ord_deaths$best_P)
-sar_recovered <- forecast_sar(log_recovered, sar_ord_recovered$best_p, sar_ord_recovered$best_P)
 
 cat("\n--- Task (e): Seasonal AR MSFE (log1p scale, test portion) ---\n")
 cat(sprintf("Cases     SAR(%d,%d)_365 | MSFE = %.6f\n",
             sar_ord_cases$best_p,     sar_ord_cases$best_P,     sar_cases$msfe))
 cat(sprintf("Deaths    SAR(%d,%d)_365 | MSFE = %.6f\n",
             sar_ord_deaths$best_p,    sar_ord_deaths$best_P,    sar_deaths$msfe))
-cat(sprintf("Recovered SAR(%d,%d)_365 | MSFE = %.6f\n",
-            sar_ord_recovered$best_p, sar_ord_recovered$best_P, sar_recovered$msfe))
 
 # All three models (AR, ARX, SAR) now use log1p scale with d=1 internal differencing,
 # so MSFE values are directly comparable across all models.
+if (!exists("arx_cases") || !exists("arx_deaths")) {
+  stop(
+    "ARX results not found (arx_cases/arx_deaths). ",
+    "Run Task (d) first, then run Task (e) comparison/plots."
+  )
+}
+
 cat("\n--- Model comparison: AR vs ARX vs SAR (MSFE all on log1p scale) ---\n")
 cat(sprintf("Cases:     AR=%.6f | ARX=%.6f | SAR=%.6f\n",
             fc_cases$msfe,     arx_cases$msfe,     sar_cases$msfe))
 cat(sprintf("Deaths:    AR=%.6f | ARX=%.6f | SAR=%.6f\n",
             fc_deaths$msfe,    arx_deaths$msfe,    sar_deaths$msfe))
-cat(sprintf("Recovered: AR=%.6f | ARX=%.6f | SAR=%.6f\n",
-            fc_recovered$msfe, arx_recovered$msfe, sar_recovered$msfe))
 
 # 12.7 Plot helper
 plot_sar_panel <- function(res, best_p, best_P, series_name, col_act, col_fc) {
@@ -1060,19 +1215,17 @@ plot_sar_panel <- function(res, best_p, best_P, series_name, col_act, col_fc) {
 }
 
 # Screen display
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 plot_sar_panel(sar_cases,     sar_ord_cases$best_p,     sar_ord_cases$best_P,     "Cases",     "steelblue", "orange")
 plot_sar_panel(sar_deaths,    sar_ord_deaths$best_p,    sar_ord_deaths$best_P,    "Deaths",    "firebrick", "purple")
-plot_sar_panel(sar_recovered, sar_ord_recovered$best_p, sar_ord_recovered$best_P, "Recovered", "darkgreen", "darkorange")
 par(mfrow = c(1, 1))
 
 # Save to PNG
 png(filename = file.path(plot_dir, "08_sar_forecast.png"),
     width = 1600, height = 1400, res = 150)
-par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
 plot_sar_panel(sar_cases,     sar_ord_cases$best_p,     sar_ord_cases$best_P,     "Cases",     "steelblue", "orange")
 plot_sar_panel(sar_deaths,    sar_ord_deaths$best_p,    sar_ord_deaths$best_P,    "Deaths",    "firebrick", "purple")
-plot_sar_panel(sar_recovered, sar_ord_recovered$best_p, sar_ord_recovered$best_P, "Recovered", "darkgreen", "darkorange")
 par(mfrow = c(1, 1))
 dev.off()
 cat("Saved seasonal AR forecast plot to:", file.path(plot_dir, "08_sar_forecast.png"), "\n")
@@ -1088,8 +1241,8 @@ cat("Saved seasonal AR forecast plot to:", file.path(plot_dir, "08_sar_forecast.
 ### MSFE values across all three models (AR, ARX, SAR) are on the log1p
 ### scale and are therefore directly comparable without rescaling.
 ###
-### Recovered series is included, but note in the report that recovered counts
-### are partly estimated by RKI and can be affected by reporting corrections.
+### Forecasting sections in tasks (c), (d), and (e) focus on Cases and Deaths.
+### Recovered is kept only for exploratory/descriptive context above.
 ###
 ### Task (e): The seasonal AR model Phi(B^365) phi(B) y_t = epsilon_t
 ### (fit as SARIMA(p,1,0)(P,1,0)[365] on log1p scale) captures both
@@ -1103,6 +1256,8 @@ ts_ex[[1]]
 plot(ts_ex, type = "l")
 lines(sar_cases$yhat, col = "red", lty = 2)
 
+plot(ts_ex,type = 'l')
+lines()
 
 err_ar  <- fc_cases$yact  - fc_cases$yhat
 err_sar <- sar_cases$yact - sar_cases$yhat
