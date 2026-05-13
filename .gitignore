@@ -1,0 +1,15 @@
+# Large data files
+*.csv
+*.xlsx
+
+# R output
+.Rhistory
+.RData
+.Ruserdata
+
+# Plots (can regenerate from script)
+plots/
+
+# OS
+.DS_Store
+Thumbs.db
