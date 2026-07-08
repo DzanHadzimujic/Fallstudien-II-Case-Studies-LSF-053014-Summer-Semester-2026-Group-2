@@ -249,7 +249,8 @@ model_input <- all_dates %>%
   mutate(
     temp_c = replace(temp_c, is.na(temp_c), 0),
     top_age_cases = replace(top_age_cases, is.na(top_age_cases), 0L),
-    start_of_week = as.integer(format(Meldedatum, "%u") == 1),
+    # Deterministic calendar regressor at time t (known at forecast origin).
+    start_of_week_t = as.integer(format(Meldedatum, "%u") == 1),
     day_of_week = factor(
       as.integer(format(Meldedatum, "%u")),
       levels = 1:7,
@@ -281,7 +282,7 @@ make_supervised_data <- function(df, lag_max = 10) {
     "target_date",
     "temp_c",
     "top_age_cases",
-    "start_of_week",
+    "start_of_week_t",
     paste0("lag_", seq_len(lag_max))
   )
 
@@ -542,11 +543,11 @@ sar_roll <- rolling_sar_forecast(daily_cases, model_data, test_rows, sar_choice$
 ### 6. Linear models ----------------------------------------------------------
 covariate_specs <- list(
   age = c("top_age_cases"),
-  week = c("start_of_week"),
+  week = c("start_of_week_t"),
   temp = c("temp_c")
 )
 
-covariate_all <- c("top_age_cases", "start_of_week", "temp_c")
+covariate_all <- c("top_age_cases", "start_of_week_t", "temp_c")
 
 linear_static <- bind_rows(lapply(names(covariate_specs), function(spec_name) {
   static_supervised_forecast(
@@ -633,6 +634,69 @@ best_tree_lags <- tree_best_lags[1, ]
 best_tree_cov <- tree_best_cov[1, ]
 best_rf_lags <- rf_best_lags[1, ]
 best_rf_cov <- rf_best_cov[1, ]
+
+ml_tuning_latex_df <- data.frame(
+  Model = c("Tree (lags)", "Tree (covariates)", "RF (lags)", "RF (covariates)"),
+  Features = c(
+    "Lagged cases only",
+    "Lagged cases + contemporaneous covariates",
+    "Lagged cases only",
+    "Lagged cases + contemporaneous covariates"
+  ),
+  cp = c(
+    sprintf("%.4f", as.numeric(best_tree_lags$cp)),
+    sprintf("%.4f", as.numeric(best_tree_cov$cp)),
+    "--",
+    "--"
+  ),
+  minsplit = c(
+    as.integer(best_tree_lags$minsplit),
+    as.integer(best_tree_cov$minsplit),
+    "--",
+    "--"
+  ),
+  maxdepth = c(
+    as.integer(best_tree_lags$maxdepth),
+    as.integer(best_tree_cov$maxdepth),
+    "--",
+    "--"
+  ),
+  ntree = c(
+    "--",
+    "--",
+    as.integer(best_rf_lags$ntree),
+    as.integer(best_rf_cov$ntree)
+  ),
+  mtry = c(
+    "--",
+    "--",
+    as.integer(best_rf_lags$mtry),
+    as.integer(best_rf_cov$mtry)
+  ),
+  nodesize = c(
+    "--",
+    "--",
+    as.integer(best_rf_lags$nodesize),
+    as.integer(best_rf_cov$nodesize)
+  ),
+  Validation_RMSFE = c(
+    sprintf("%.4f", tree_best_lags$RMSFE[1]),
+    sprintf("%.4f", tree_best_cov$RMSFE[1]),
+    sprintf("%.4f", rf_best_lags$RMSFE[1]),
+    sprintf("%.4f", rf_best_cov$RMSFE[1])
+  ),
+  stringsAsFactors = FALSE
+)
+
+ml_tuning_tex <- build_latex_table(
+  ml_tuning_latex_df,
+  "Best machine-learning hyperparameter settings and validation RMSFE",
+  "tab:project3_ml_tuning",
+  "llcccccc",
+  c("Model", "Features", "cp", "minsplit", "maxdepth", "ntree", "mtry", "nodesize", "Validation RMSFE")
+)
+
+writeLines(ml_tuning_tex, file.path(table_dir, "project3_ml_tuning.tex"))
 
 tree_lags_roll <- rolling_supervised_forecast(
   data = model_data,
@@ -823,49 +887,70 @@ plot_forecasts <- function(df, title_text, file_prefix) {
 plot_files_ar <- plot_forecasts(ar_roll, "AR benchmark forecast", "project3_ar_forecast")
 plot_files_ar_taska <- plot_forecasts(ar_taska_roll, "Task a ARIMA forecast", "project3_ar_taska_forecast")
 plot_files_sar <- plot_forecasts(sar_roll, "Seasonal AR forecast", "project3_sar_forecast")
-plot_files_linear_static <- plot_forecasts(linear_static, "Task c linear forecasts (fixed training)", "project3_linear_static_forecasts")
-plot_files_linear <- plot_forecasts(linear_roll, "Rolling linear forecasts with covariates", "project3_linear_forecasts")
 plot_files_ml <- plot_forecasts(bind_rows(tree_lags_roll, tree_cov_roll, rf_lags_roll, rf_cov_roll), "Machine learning forecasts", "project3_ml_forecasts")
-plot_files_all <- c(plot_files_ar, plot_files_ar_taska, plot_files_sar, plot_files_linear_static, plot_files_linear, plot_files_ml)
+plot_files_all <- c(plot_files_ar, plot_files_ar_taska, plot_files_sar, plot_files_ml)
 
-# Task-c combined figure: actual plus all single-covariate OLS forecasts in one plot.
-linear_static_wide <- reshape(
-  linear_static[, c("target_date", "model", "forecast")],
-  timevar = "model",
-  idvar = "target_date",
-  direction = "wide"
-)
-linear_actual <- linear_static[linear_static$model == unique(linear_static$model)[1], c("target_date", "actual")]
-linear_combined <- merge(linear_actual, linear_static_wide, by = "target_date", all.x = TRUE)
+plot_linear_combined <- function(df, title_text, out_file) {
+  linear_wide <- reshape(
+    df[, c("target_date", "model", "forecast")],
+    timevar = "model",
+    idvar = "target_date",
+    direction = "wide"
+  )
 
-combined_file <- file.path(plot_dir, "project3_task_c_linear_combined.png")
-png(filename = combined_file, width = 1600, height = 900, res = 150)
-plot(
-  linear_combined$target_date,
-  linear_combined$actual,
-  type = "l",
-  col = "black",
-  lwd = 1.4,
-  xlab = "Date",
-  ylab = "Daily cases",
-  main = "Task c: Actual vs OLS forecasts (one covariate at a time)"
-)
-for (j in seq_along(names(linear_combined))) {
-  n <- names(linear_combined)[j]
-  if (grepl("^forecast\\.", n)) {
-    lines(linear_combined$target_date, linear_combined[[n]], lwd = 1)
+  linear_actual <- df[df$model == unique(df$model)[1], c("target_date", "actual")]
+  linear_combined <- merge(linear_actual, linear_wide, by = "target_date", all.x = TRUE)
+  forecast_names <- names(linear_combined)[grepl("^forecast\\.", names(linear_combined))]
+  forecast_labels <- gsub("^forecast\\.LM_", "LM_", forecast_names)
+  forecast_cols <- grDevices::hcl.colors(length(forecast_names), palette = "Dark 3")
+
+  png(filename = out_file, width = 1600, height = 900, res = 150)
+  plot(
+    linear_combined$target_date,
+    linear_combined$actual,
+    type = "l",
+    col = "black",
+    lwd = 1.6,
+    xlab = "Date",
+    ylab = "Daily cases",
+    main = title_text
+  )
+
+  for (j in seq_along(forecast_names)) {
+    lines(
+      linear_combined$target_date,
+      linear_combined[[forecast_names[j]]],
+      lwd = 1.1,
+      col = forecast_cols[j]
+    )
   }
+
+  legend(
+    "top",
+    legend = c("Actual", forecast_labels),
+    col = c("black", forecast_cols),
+    lty = 1,
+    bty = "n",
+    cex = 0.85,
+    horiz = TRUE
+  )
+  dev.off()
+  out_file
 }
-legend(
-  "topright",
-  legend = c("Actual", gsub("^forecast\\.LM_", "LM_", names(linear_combined)[grepl("^forecast\\.", names(linear_combined))])),
-  col = c("black", seq_len(sum(grepl("^forecast\\.", names(linear_combined)))) + 1),
-  lty = 1,
-  bty = "n",
-  cex = 0.8
+
+task_c_file <- plot_linear_combined(
+  linear_static,
+  "Task c: Actual vs OLS forecasts (one covariate at a time, static)",
+  file.path(plot_dir, "project3_task_c_linear_combined.png")
 )
-dev.off()
-plot_files_all <- c(plot_files_all, combined_file)
+
+task_d_file <- plot_linear_combined(
+  linear_roll,
+  "Task d: Actual vs OLS forecasts (one covariate at a time, dynamic)",
+  file.path(plot_dir, "project3_task_d_linear_combined.png")
+)
+
+plot_files_all <- c(plot_files_all, task_c_file, task_d_file)
 
 ### 10. Diebold-Mariano tests ------------------------------------------------
 dm_test_pair <- function(df, model_1, model_2) {
@@ -874,26 +959,34 @@ dm_test_pair <- function(df, model_1, model_2) {
   aligned <- inner_join(d1, d2, by = "target_date", suffix = c("_1", "_2"))
   if (nrow(aligned) == 0) stop("No overlapping forecast dates for DM test.")
 
-  dm <- forecast::dm.test(aligned$error_1, aligned$error_2, h = 1, power = 2)
+  h <- 1
+  power <- 2
+  varestimator <- "acf"
+  dm <- forecast::dm.test(
+    aligned$error_1,
+    aligned$error_2,
+    h = h,
+    power = power,
+    varestimator = varestimator
+  )
+  loss_diff <- aligned$error_1^power - aligned$error_2^power
+
   data.frame(
     model_1 = model_1,
     model_2 = model_2,
+    n_obs = nrow(aligned),
+    h = h,
+    power = power,
+    varestimator = varestimator,
+    mean_loss_diff = mean(loss_diff),
     dm_statistic = unname(dm$statistic),
     p_value = dm$p.value,
     stringsAsFactors = FALSE
   )
 }
 
-best_linear_model <- rmsfe_table$model[grepl("^LM_", rmsfe_table$model)][1]
-best_ml_model <- rmsfe_table$model[grepl("^(Tree|RF)_", rmsfe_table$model)][1]
-
-dm_pairs <- list(
-  c(ar_roll$model[1], best_linear_model),
-  c(ar_roll$model[1], sar_roll$model[1]),
-  c(ar_roll$model[1], best_ml_model),
-  c(best_linear_model, best_ml_model),
-  c(best_linear_model, sar_roll$model[1])
-)
+model_names_all <- sort(unique(forecast_table$model))
+dm_pairs <- combn(model_names_all, 2, simplify = FALSE)
 
 dm_results <- bind_rows(lapply(dm_pairs, function(pair) dm_test_pair(forecast_table, pair[1], pair[2]))) %>%
   arrange(p_value)
@@ -901,50 +994,114 @@ dm_results <- bind_rows(lapply(dm_pairs, function(pair) dm_test_pair(forecast_ta
 print(dm_results)
 write.csv(dm_results, file.path(table_dir, "project3_dm_tests.csv"), row.names = FALSE)
 
-# -----------------------------
-# DM-test interpretation notes
-# -----------------------------
-# What is tested:
-# - Diebold-Mariano (DM) compares predictive accuracy of two forecast models.
-# - Null hypothesis: equal expected loss for both models.
-# - Here the loss is squared forecast error (power = 2) with one-step horizon (h = 1).
-#
-# Which models are compared:
-# - AR(7)_roll (common benchmark required by the course)
-# - LM_all_roll (best linear model with all covariates)
-# - SAR(5,2)[7]_roll (best seasonal benchmark from this script run)
-# - RF_cov_roll (best ML model from this script run)
-#
-# How to read the results:
-# - p-value < 0.05: reject equal predictive accuracy (statistically significant difference).
-# - p-value >= 0.05: no statistically significant difference on this test sample.
-#
-# Conclusions from current output (project3_dm_tests.csv):
-# - AR(7) vs LM_all: significant (p < 0.05), LM_all outperforms AR(7).
-# - AR(7) vs SAR: significant (p < 0.05), SAR outperforms AR(7).
-# - AR(7) vs RF_cov: not significant.
-# - LM_all vs SAR: not significant.
-# - LM_all vs RF_cov: not significant.
-#
-# Practical takeaway:
-# - AR(7) is a useful baseline but is significantly weaker than stronger linear/seasonal variants.
-# - Among top non-benchmark models, ranking by RMSFE exists, but pairwise DM evidence is not strong.
+dm_pvalue_matrix <- matrix(
+  NA_real_,
+  nrow = length(model_names_all),
+  ncol = length(model_names_all),
+  dimnames = list(model_names_all, model_names_all)
+)
+
+for (i in seq_len(nrow(dm_results))) {
+  m1 <- dm_results$model_1[i]
+  m2 <- dm_results$model_2[i]
+  pv <- dm_results$p_value[i]
+  dm_pvalue_matrix[m1, m2] <- pv
+  dm_pvalue_matrix[m2, m1] <- pv
+}
+
+diag(dm_pvalue_matrix) <- 0.5
+dm_heatmap_file <- file.path(plot_dir, "project3_dm_pvalue_heatmap.png")
+png(filename = dm_heatmap_file, width = 3000, height = 2200, res = 220)
+
+# Order models by forecast performance for a cleaner and more interpretable heatmap.
+model_order <- rmsfe_table$model
+dm_plot <- dm_pvalue_matrix[model_order, model_order]
+n_models <- length(model_order)
+col_palette <- grDevices::colorRampPalette(c("#7f0000", "#b30000", "#ef8a62", "#fddbc7", "#f7f7f7", "#92c5de", "#2166ac"))(200)
+
+# Short labels help the matrix occupy more of the plotting canvas.
+pretty_labels <- model_order
+pretty_labels <- gsub("_roll", " (refit)", pretty_labels)
+pretty_labels <- gsub("_static", " (static)", pretty_labels)
+pretty_labels <- gsub("_taska", "", pretty_labels)
+pretty_labels <- gsub("^LM_", "LM-", pretty_labels)
+pretty_labels <- gsub("^Tree_", "Tree-", pretty_labels)
+pretty_labels <- gsub("^RF_", "RF-", pretty_labels)
+
+par(oma = c(0, 0, 0, 0))
+
+par(fig = c(0.04, 0.90, 0.08, 0.96), mar = c(9, 11, 4, 1))
+image(
+  x = seq_len(n_models),
+  y = seq_len(n_models),
+  z = t(dm_plot[n_models:1, , drop = FALSE]),
+  col = col_palette,
+  zlim = c(0, 1),
+  xaxt = "n",
+  yaxt = "n",
+  xlab = "",
+  ylab = "",
+  main = "Pairwise Diebold-Mariano p-value heatmap (h = 1, power = 2, varestimator = acf)"
+)
+
+axis(1, at = seq_len(n_models), labels = pretty_labels, las = 2, cex.axis = 0.95)
+axis(2, at = seq_len(n_models), labels = rev(pretty_labels), las = 2, cex.axis = 0.95)
+abline(h = seq(0.5, n_models + 0.5, by = 1), v = seq(0.5, n_models + 0.5, by = 1), col = "white", lwd = 0.5)
+
+# Print p-values inside each cell to improve readability beyond colors.
+cell_cex <- if (n_models <= 10) 0.9 else 0.75
+for (i in seq_len(n_models)) {
+  for (j in seq_len(n_models)) {
+    text(
+      x = j,
+      y = n_models - i + 1,
+      labels = sprintf("%.2f", dm_plot[i, j]),
+      col = "black",
+      cex = cell_cex
+    )
+  }
+}
+
+box()
+
+# Add a dedicated color bar for p-values.
+par(fig = c(0.92, 0.95, 0.20, 0.88), new = TRUE, mar = c(6, 1, 2, 4))
+image(
+  x = 1,
+  y = seq(0, 1, length.out = 200),
+  z = matrix(seq(0, 1, length.out = 200), ncol = 1),
+  col = col_palette,
+  xaxt = "n",
+  yaxt = "n",
+  xlab = "",
+  ylab = ""
+)
+axis(4, at = seq(0, 1, by = 0.2), labels = sprintf("%.1f", seq(0, 1, by = 0.2)), las = 2, cex.axis = 0.85)
+mtext("p-value", side = 4, line = 2.5, cex = 0.9)
+
+dev.off()
+plot_files_all <- c(plot_files_all, dm_heatmap_file)
 
 dm_latex_df <- dm_results %>%
   mutate(
     model_1 = fmt_model(model_1),
     model_2 = fmt_model(model_2),
+    n_obs = as.character(n_obs),
+    h = as.character(h),
+    power = as.character(power),
+    varestimator = as.character(varestimator),
+    mean_loss_diff = sprintf("%.4f", mean_loss_diff),
     dm_statistic = sprintf("%.4f", dm_statistic),
     p_value = sprintf("%.4f", p_value)
   ) %>%
   as.data.frame(stringsAsFactors = FALSE)
 
 dm_tex <- build_latex_table(
-  dm_latex_df[, c("model_1", "model_2", "dm_statistic", "p_value")],
-  "Diebold-Mariano test results (squared-error loss, h = 1)",
+  dm_latex_df[, c("model_1", "model_2", "n_obs", "h", "power", "varestimator", "mean_loss_diff", "dm_statistic", "p_value")],
+  "Pairwise Diebold-Mariano test results across all models",
   "tab:project3_dm",
-  "llcc",
-  c("Model 1", "Model 2", "DM statistic", "p-value")
+  "llcccclcc",
+  c("Model 1", "Model 2", "N", "h", "power", "LRV est.", "Mean loss diff", "DM statistic", "p-value")
 )
 
 writeLines(dm_tex, file.path(table_dir, "project3_dm_tests.tex"))
@@ -963,6 +1120,7 @@ for (pf in plot_files_all) {
 cat(" -", file.path(table_dir, "project3_forecasts.csv"), "\n")
 cat(" -", file.path(table_dir, "project3_rmsfe_table.csv"), "\n")
 cat(" -", file.path(table_dir, "project3_bic_selection.tex"), "\n")
+cat(" -", file.path(table_dir, "project3_ml_tuning.tex"), "\n")
 cat(" -", file.path(table_dir, "project3_rmsfe_table.tex"), "\n")
 cat(" -", file.path(table_dir, "project3_dm_tests.csv"), "\n")
 cat(" -", file.path(table_dir, "project3_dm_tests.tex"), "\n")
@@ -970,3 +1128,4 @@ cat(" -", file.path(table_dir, "project3_dm_tests.tex"), "\n")
 ### Dm models against every model, heatplot to see the difference, see on the literature.
 ### Packages in R
 ### Provide all information of the test statistic, long run value estimator.
+
