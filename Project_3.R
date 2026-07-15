@@ -8,6 +8,7 @@ library(readr)
 library(forecast)
 library(rpart)
 library(randomForest)
+library(ggplot2)
 
 if (!requireNamespace("jsonlite", quietly = TRUE)) {
   stop("Package 'jsonlite' is required. Install once with: install.packages('jsonlite')")
@@ -15,6 +16,10 @@ if (!requireNamespace("jsonlite", quietly = TRUE)) {
 
 if (!requireNamespace("zoo", quietly = TRUE)) {
   stop("Package 'zoo' is required. Install once with: install.packages('zoo')")
+}
+
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  stop("Package 'ggplot2' is required. Install once with: install.packages('ggplot2')")
 }
 
 set.seed(12345)
@@ -291,6 +296,7 @@ make_supervised_data <- function(df, lag_max = 10) {
 
 model_data <- make_supervised_data(model_input, lag_max = lag_max)
 lag_cols <- paste0("lag_", seq_len(lag_max))
+shared_covariates <- c("top_age_cases", "start_of_week_t", "temp_c")
 
 n_obs <- nrow(model_data)
 train_end <- floor(0.8 * n_obs)
@@ -325,6 +331,16 @@ fit_ols <- function(train_df, extra_terms) {
 
 fit_ols_covariate_only <- function(train_df, extra_terms) {
   lm(build_covariate_only_formula(extra_terms), data = train_df)
+}
+
+build_arx_formula <- function(p, extra_terms) {
+  ar_terms <- paste0("lag_", seq_len(p))
+  rhs <- c(ar_terms, extra_terms)
+  as.formula(paste("target_log ~", paste(rhs, collapse = " + ")))
+}
+
+fit_arx <- function(train_df, p, extra_terms) {
+  lm(build_arx_formula(p, extra_terms), data = train_df)
 }
 
 fit_tree <- function(train_df, extra_terms, cp, minsplit, maxdepth) {
@@ -468,6 +484,44 @@ rolling_sar_forecast <- function(full_cases, data, eval_rows, p, P, season = 7) 
   )
 }
 
+rolling_arx_forecast <- function(data, eval_rows, p, d, extra_terms) {
+  preds <- numeric(length(eval_rows))
+  actual <- numeric(length(eval_rows))
+
+  keep_cols <- c("target_cases", "target_log", "target_date", "current_date", extra_terms)
+
+  # ARX baseline: rolling ARIMA(p,d,0) with exogenous covariates.
+  for (i in seq_along(eval_rows)) {
+    row_id <- eval_rows[i]
+    train_df <- data[seq_len(row_id - 1), keep_cols, drop = FALSE]
+    new_df <- data[row_id, keep_cols, drop = FALSE]
+
+    fit <- Arima(
+      train_df$target_log,
+      order = c(p, d, 0),
+      include.mean = (d == 0),
+      xreg = as.matrix(train_df[, extra_terms, drop = FALSE]),
+      method = "ML"
+    )
+    fc <- forecast::forecast(
+      fit,
+      h = 1,
+      xreg = as.matrix(new_df[, extra_terms, drop = FALSE])
+    )
+    preds[i] <- to_cases(fc$mean)
+    actual[i] <- new_df$target_cases
+  }
+
+  data.frame(
+    target_date = data$target_date[eval_rows],
+    actual = as.numeric(actual),
+    forecast = as.numeric(preds),
+    error = as.numeric(actual - preds),
+    sq_error = as.numeric((actual - preds)^2),
+    stringsAsFactors = FALSE
+  )
+}
+
 select_sar_order <- function(series_log, train_end_row, max_p = 5, max_P = 2, season = 7) {
   best <- list(bic = Inf, p = 0, P = 0)
 
@@ -540,6 +594,18 @@ ar_taska_roll <- rolling_ar_forecast(daily_cases, model_data, test_rows, ar_task
 sar_roll <- rolling_sar_forecast(daily_cases, model_data, test_rows, sar_choice$p, sar_choice$P, season = 7) %>%
   mutate(model = paste0("SAR(", sar_choice$p, ",", sar_choice$P, ")[7]_roll"))
 
+arx_choice <- list(best_p = 9, best_d = 1)
+cat("ARX benchmark order fixed to: (", arx_choice$best_p, ",", arx_choice$best_d, ",0) with covariates = top_age_cases, start_of_week_t, temp_c\n", sep = "")
+
+arx_roll <- rolling_arx_forecast(
+  data = model_data,
+  eval_rows = test_rows,
+  p = arx_choice$best_p,
+  d = arx_choice$best_d,
+  extra_terms = shared_covariates
+) %>%
+  mutate(model = paste0("ARX(", arx_choice$best_p, ",", arx_choice$best_d, ",0)_roll"))
+
 ### 6. Linear models ----------------------------------------------------------
 covariate_specs <- list(
   age = c("top_age_cases"),
@@ -547,7 +613,7 @@ covariate_specs <- list(
   temp = c("temp_c")
 )
 
-covariate_all <- c("top_age_cases", "start_of_week_t", "temp_c")
+covariate_all <- shared_covariates
 
 linear_static <- bind_rows(lapply(names(covariate_specs), function(spec_name) {
   static_supervised_forecast(
@@ -755,6 +821,7 @@ forecast_table <- bind_rows(
   ar_roll,
   ar_taska_roll,
   sar_roll,
+  arx_roll,
   linear_static,
   linear_roll,
   tree_lags_roll,
@@ -887,8 +954,9 @@ plot_forecasts <- function(df, title_text, file_prefix) {
 plot_files_ar <- plot_forecasts(ar_roll, "AR benchmark forecast", "project3_ar_forecast")
 plot_files_ar_taska <- plot_forecasts(ar_taska_roll, "Task a ARIMA forecast", "project3_ar_taska_forecast")
 plot_files_sar <- plot_forecasts(sar_roll, "Seasonal AR forecast", "project3_sar_forecast")
+plot_files_arx <- plot_forecasts(arx_roll, "ARX forecast", "project3_arx_forecast")
 plot_files_ml <- plot_forecasts(bind_rows(tree_lags_roll, tree_cov_roll, rf_lags_roll, rf_cov_roll), "Machine learning forecasts", "project3_ml_forecasts")
-plot_files_all <- c(plot_files_ar, plot_files_ar_taska, plot_files_sar, plot_files_ml)
+plot_files_all <- c(plot_files_ar, plot_files_ar_taska, plot_files_sar, plot_files_arx, plot_files_ml)
 
 plot_linear_combined <- function(df, title_text, out_file) {
   linear_wide <- reshape(
@@ -953,7 +1021,7 @@ task_d_file <- plot_linear_combined(
 plot_files_all <- c(plot_files_all, task_c_file, task_d_file)
 
 ### 10. Diebold-Mariano tests ------------------------------------------------
-dm_test_pair <- function(df, model_1, model_2) {
+dm_test_pair <- function(df, model_1, model_2, alternative = "less") {
   d1 <- df %>% filter(model == model_1) %>% select(target_date, error)
   d2 <- df %>% filter(model == model_2) %>% select(target_date, error)
   aligned <- inner_join(d1, d2, by = "target_date", suffix = c("_1", "_2"))
@@ -967,6 +1035,7 @@ dm_test_pair <- function(df, model_1, model_2) {
     aligned$error_2,
     h = h,
     power = power,
+    alternative = alternative,
     varestimator = varestimator
   )
   loss_diff <- aligned$error_1^power - aligned$error_2^power
@@ -978,6 +1047,7 @@ dm_test_pair <- function(df, model_1, model_2) {
     h = h,
     power = power,
     varestimator = varestimator,
+    alternative = alternative,
     mean_loss_diff = mean(loss_diff),
     dm_statistic = unname(dm$statistic),
     p_value = dm$p.value,
@@ -986,9 +1056,23 @@ dm_test_pair <- function(df, model_1, model_2) {
 }
 
 model_names_all <- sort(unique(forecast_table$model))
-dm_pairs <- combn(model_names_all, 2, simplify = FALSE)
+# One-tailed DM test: H1 is that model_1 has lower expected loss than model_2.
+dm_alternative <- "less"
+dm_pairs <- expand.grid(
+  model_1 = model_names_all,
+  model_2 = model_names_all,
+  stringsAsFactors = FALSE
+) %>%
+  filter(model_1 != model_2)
 
-dm_results <- bind_rows(lapply(dm_pairs, function(pair) dm_test_pair(forecast_table, pair[1], pair[2]))) %>%
+dm_results <- bind_rows(lapply(seq_len(nrow(dm_pairs)), function(i) {
+  dm_test_pair(
+    forecast_table,
+    dm_pairs$model_1[i],
+    dm_pairs$model_2[i],
+    alternative = dm_alternative
+  )
+})) %>%
   arrange(p_value)
 
 print(dm_results)
@@ -1006,12 +1090,10 @@ for (i in seq_len(nrow(dm_results))) {
   m2 <- dm_results$model_2[i]
   pv <- dm_results$p_value[i]
   dm_pvalue_matrix[m1, m2] <- pv
-  dm_pvalue_matrix[m2, m1] <- pv
 }
 
 diag(dm_pvalue_matrix) <- 0.5
 dm_heatmap_file <- file.path(plot_dir, "project3_dm_pvalue_heatmap.png")
-png(filename = dm_heatmap_file, width = 3000, height = 2200, res = 220)
 
 # Order models by forecast performance for a cleaner and more interpretable heatmap.
 model_order <- rmsfe_table$model
@@ -1028,58 +1110,43 @@ pretty_labels <- gsub("^LM_", "LM-", pretty_labels)
 pretty_labels <- gsub("^Tree_", "Tree-", pretty_labels)
 pretty_labels <- gsub("^RF_", "RF-", pretty_labels)
 
-par(oma = c(0, 0, 0, 0))
+label_map <- setNames(pretty_labels, model_order)
+dm_plot_df <- as.data.frame(as.table(dm_plot), stringsAsFactors = FALSE)
+names(dm_plot_df) <- c("model_1", "model_2", "p_value")
+dm_plot_df$model_1 <- factor(dm_plot_df$model_1, levels = rev(model_order), labels = rev(pretty_labels))
+dm_plot_df$model_2 <- factor(dm_plot_df$model_2, levels = model_order, labels = pretty_labels)
+dm_plot_df$p_label <- ifelse(is.na(dm_plot_df$p_value), "", sprintf("%.2f", dm_plot_df$p_value))
 
-par(fig = c(0.04, 0.90, 0.08, 0.96), mar = c(9, 11, 4, 1))
-image(
-  x = seq_len(n_models),
-  y = seq_len(n_models),
-  z = t(dm_plot[n_models:1, , drop = FALSE]),
-  col = col_palette,
-  zlim = c(0, 1),
-  xaxt = "n",
-  yaxt = "n",
-  xlab = "",
-  ylab = "",
-  main = "Pairwise Diebold-Mariano p-value heatmap (h = 1, power = 2, varestimator = acf)"
+dm_heatmap_plot <- ggplot2::ggplot(dm_plot_df, ggplot2::aes(x = model_2, y = model_1, fill = p_value)) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.4) +
+  ggplot2::geom_text(ggplot2::aes(label = p_label), size = if (n_models <= 10) 4.1 else 3.3) +
+  ggplot2::scale_fill_gradientn(
+    colours = col_palette,
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.2),
+    name = "p-value"
+  ) +
+  ggplot2::coord_equal() +
+  ggplot2::labs(
+    title = "Pairwise Diebold-Mariano p-value heatmap (h = 1, power = 2, varestimator = acf)",
+    subtitle = "One-tailed test (alternative = less): row model has lower expected loss than column model",
+    x = NULL,
+    y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 1),
+    panel.grid = ggplot2::element_blank(),
+    plot.title = ggplot2::element_text(face = "bold")
+  )
+
+ggplot2::ggsave(
+  filename = dm_heatmap_file,
+  plot = dm_heatmap_plot,
+  width = 13,
+  height = 10,
+  dpi = 220
 )
-
-axis(1, at = seq_len(n_models), labels = pretty_labels, las = 2, cex.axis = 0.95)
-axis(2, at = seq_len(n_models), labels = rev(pretty_labels), las = 2, cex.axis = 0.95)
-abline(h = seq(0.5, n_models + 0.5, by = 1), v = seq(0.5, n_models + 0.5, by = 1), col = "white", lwd = 0.5)
-
-# Print p-values inside each cell to improve readability beyond colors.
-cell_cex <- if (n_models <= 10) 0.9 else 0.75
-for (i in seq_len(n_models)) {
-  for (j in seq_len(n_models)) {
-    text(
-      x = j,
-      y = n_models - i + 1,
-      labels = sprintf("%.2f", dm_plot[i, j]),
-      col = "black",
-      cex = cell_cex
-    )
-  }
-}
-
-box()
-
-# Add a dedicated color bar for p-values.
-par(fig = c(0.92, 0.95, 0.20, 0.88), new = TRUE, mar = c(6, 1, 2, 4))
-image(
-  x = 1,
-  y = seq(0, 1, length.out = 200),
-  z = matrix(seq(0, 1, length.out = 200), ncol = 1),
-  col = col_palette,
-  xaxt = "n",
-  yaxt = "n",
-  xlab = "",
-  ylab = ""
-)
-axis(4, at = seq(0, 1, by = 0.2), labels = sprintf("%.1f", seq(0, 1, by = 0.2)), las = 2, cex.axis = 0.85)
-mtext("p-value", side = 4, line = 2.5, cex = 0.9)
-
-dev.off()
 plot_files_all <- c(plot_files_all, dm_heatmap_file)
 
 dm_latex_df <- dm_results %>%
@@ -1090,6 +1157,7 @@ dm_latex_df <- dm_results %>%
     h = as.character(h),
     power = as.character(power),
     varestimator = as.character(varestimator),
+    alternative = as.character(alternative),
     mean_loss_diff = sprintf("%.4f", mean_loss_diff),
     dm_statistic = sprintf("%.4f", dm_statistic),
     p_value = sprintf("%.4f", p_value)
@@ -1097,11 +1165,11 @@ dm_latex_df <- dm_results %>%
   as.data.frame(stringsAsFactors = FALSE)
 
 dm_tex <- build_latex_table(
-  dm_latex_df[, c("model_1", "model_2", "n_obs", "h", "power", "varestimator", "mean_loss_diff", "dm_statistic", "p_value")],
+  dm_latex_df[, c("model_1", "model_2", "n_obs", "h", "power", "varestimator", "alternative", "mean_loss_diff", "dm_statistic", "p_value")],
   "Pairwise Diebold-Mariano test results across all models",
   "tab:project3_dm",
-  "llcccclcc",
-  c("Model 1", "Model 2", "N", "h", "power", "LRV est.", "Mean loss diff", "DM statistic", "p-value")
+  "llccccccccc",
+  c("Model 1", "Model 2", "N", "h", "power", "LRV est.", "Alternative", "Mean loss diff", "DM statistic", "p-value")
 )
 
 writeLines(dm_tex, file.path(table_dir, "project3_dm_tests.tex"))
